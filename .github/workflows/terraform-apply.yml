@@ -1,0 +1,190 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+    inputs:
+      environments:
+        description: "Comma-separated env names to force apply (e.g. dev,qa). Leave empty to auto-detect from diff."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.10.0"
+  TG_VERSION: "0.67.0"
+  AWS_REGION: "us-east-1"
+  AWS_ROLE_ARNS: |
+    {
+      "dev":  "arn:aws:iam::REPLACE_ME_DEV_ACCOUNT_ID:role/REPLACE_ME_GHA_ROLE",
+      "qa":   "arn:aws:iam::REPLACE_ME_QA_ACCOUNT_ID:role/REPLACE_ME_GHA_ROLE",
+      "prod": "arn:aws:iam::REPLACE_ME_PROD_ACCOUNT_ID:role/REPLACE_ME_GHA_ROLE"
+    }
+
+jobs:
+  detect-changes:
+    name: Detect changed environments
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set-matrix.outputs.include }}
+      any: ${{ steps.set-matrix.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute diff base
+        id: base
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            BEFORE="${{ github.event.before }}"
+            if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              BEFORE=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+            fi
+            echo "sha=$BEFORE" >> "$GITHUB_OUTPUT"
+          else
+            git fetch origin main --depth=2 || true
+            echo "sha=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine affected environments
+        id: set-matrix
+        shell: bash
+        env:
+          AWS_ROLE_ARNS: ${{ env.AWS_ROLE_ARNS }}
+          FORCE_ENVS: ${{ github.event.inputs.environments }}
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.base.outputs.sha }}"
+          echo "Diffing against $BASE"
+
+          ALL_ENVS=()
+          for d in terraform/environments/*/; do
+            [ -d "$d" ] || continue
+            ALL_ENVS+=("$(basename "$d")")
+          done
+
+          if [[ -n "${FORCE_ENVS// /}" ]]; then
+            echo "workflow_dispatch override: $FORCE_ENVS"
+            IFS=',' read -ra RAW <<< "$FORCE_ENVS"
+            SELECTED=()
+            for e in "${RAW[@]}"; do
+              e_trimmed="$(echo "$e" | xargs)"
+              [[ -z "$e_trimmed" ]] && continue
+              if [[ ! -d "terraform/environments/$e_trimmed" ]]; then
+                echo "::error::Requested env '$e_trimmed' has no folder under terraform/environments/" >&2
+                exit 1
+              fi
+              SELECTED+=("$e_trimmed")
+            done
+          else
+            CHANGED=$(git diff --name-only "$BASE" HEAD -- terraform/ || true)
+            echo "Changed files:"
+            echo "$CHANGED"
+
+            if echo "$CHANGED" | grep -qE '^terraform/modules/'; then
+              echo "Module change detected -> applying ALL environments"
+              SELECTED=("${ALL_ENVS[@]}")
+            elif echo "$CHANGED" | grep -qE '^terraform/terragrunt\.hcl$'; then
+              echo "Root terragrunt.hcl change detected -> applying ALL environments"
+              SELECTED=("${ALL_ENVS[@]}")
+            else
+              SELECTED=()
+              for env in "${ALL_ENVS[@]}"; do
+                if echo "$CHANGED" | grep -qE "^terraform/environments/${env}/"; then
+                  SELECTED+=("$env")
+                fi
+              done
+            fi
+          fi
+
+          if [ ${#SELECTED[@]} -eq 0 ]; then
+            echo "No environments affected."
+            echo "include=[]" >> "$GITHUB_OUTPUT"
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          INCLUDE=$(
+            for env in "${SELECTED[@]}"; do
+              role=$(printf '%s' "$AWS_ROLE_ARNS" | jq -er --arg e "$env" '.[$e]') || {
+                echo "::error::No AWS_ROLE_ARNS entry for environment '$env'. Add it to the workflow env map." >&2
+                exit 1
+              }
+              jq -nc --arg env "$env" --arg role "$role" '{env:$env, role_arn:$role}'
+            done | jq -sc .
+          )
+          echo "Matrix include: $INCLUDE"
+          echo "include=$INCLUDE" >> "$GITHUB_OUTPUT"
+          echo "any=true" >> "$GITHUB_OUTPUT"
+
+  apply:
+    name: Apply ${{ matrix.env }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: tf-apply-${{ matrix.env }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect-changes.outputs.include) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        uses: gruntwork-io/terragrunt-action@v2
+        with:
+          tg_version: ${{ env.TG_VERSION }}
+          tf_version: ${{ env.TF_VERSION }}
+          tg_command: --version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-apply-${{ matrix.env }}
+
+      - name: Terragrunt init
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: terragrunt init -input=false -no-color
+
+      - name: Terragrunt apply
+        id: apply
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: |
+          set -o pipefail
+          terragrunt apply -input=false -auto-approve -no-color -lock-timeout=5m 2>&1 | tee apply.txt
+
+      - name: Job summary
+        if: always()
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: |
+          {
+            echo "### Terragrunt apply — \`${{ matrix.env }}\` — ${{ steps.apply.outcome }}"
+            echo ""
+            echo '<details><summary>Show apply output</summary>'
+            echo ""
+            echo '```hcl'
+            tail -c 60000 apply.txt 2>/dev/null || echo "(no output captured)"
+            echo '```'
+            echo ""
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"

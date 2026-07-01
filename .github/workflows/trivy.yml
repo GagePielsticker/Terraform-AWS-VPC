@@ -1,0 +1,100 @@
+name: Trivy IaC Scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+
+concurrency:
+  group: trivy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  trivy:
+    name: Trivy IaC scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy config scan
+        id: scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: terraform/
+          format: table
+          output: trivy.txt
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          hide-progress: "true"
+        continue-on-error: true
+
+      - name: Comment Trivy results on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- trivy:iac -->';
+
+            let scanBody = '';
+            try {
+              scanBody = fs.readFileSync('trivy.txt', 'utf8').trim();
+            } catch (e) {
+              scanBody = `Trivy output not available: ${e.message}`;
+            }
+            if (!scanBody) {
+              scanBody = 'No findings.';
+            }
+            const MAX = 60000;
+            if (scanBody.length > MAX) {
+              scanBody = `... (truncated, showing last ${MAX} chars) ...\n` + scanBody.slice(-MAX);
+            }
+
+            const status = process.env.SCAN_OUTCOME === 'success'
+              ? 'passed (no HIGH/CRITICAL findings)'
+              : 'failed (HIGH/CRITICAL findings present)';
+
+            const body = [
+              marker,
+              `### Trivy IaC scan — ${status}`,
+              '',
+              'Scanned `terraform/` for misconfigurations at severity HIGH,CRITICAL.',
+              '',
+              '<details><summary>Show Trivy output</summary>',
+              '',
+              '```',
+              scanBody,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail job on HIGH/CRITICAL findings
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error::Trivy found HIGH/CRITICAL misconfigurations in terraform/. See PR comment for details."
+          exit 1

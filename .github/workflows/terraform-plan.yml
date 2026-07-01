@@ -1,0 +1,263 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+
+concurrency:
+  group: tf-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.10.0"
+  TG_VERSION: "0.67.0"
+  AWS_REGION: "us-east-1"
+  # Per-environment OIDC role ARNs. Keys MUST match the folder names under
+  # terraform/environments/. Add a new entry when you add a new environment.
+  AWS_ROLE_ARNS: |
+    {
+      "dev":  "arn:aws:iam::REPLACE_ME_DEV_ACCOUNT_ID:role/REPLACE_ME_GHA_ROLE",
+      "qa":   "arn:aws:iam::REPLACE_ME_QA_ACCOUNT_ID:role/REPLACE_ME_GHA_ROLE",
+      "prod": "arn:aws:iam::REPLACE_ME_PROD_ACCOUNT_ID:role/REPLACE_ME_GHA_ROLE"
+    }
+
+jobs:
+  detect-changes:
+    name: Detect changed environments
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set-matrix.outputs.include }}
+      any: ${{ steps.set-matrix.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute diff base
+        id: base
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            git fetch origin main --depth=1
+            echo "sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine affected environments
+        id: set-matrix
+        shell: bash
+        env:
+          AWS_ROLE_ARNS: ${{ env.AWS_ROLE_ARNS }}
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.base.outputs.sha }}"
+          echo "Diffing against $BASE"
+
+          CHANGED=$(git diff --name-only "$BASE" HEAD -- terraform/ || true)
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          ALL_ENVS=()
+          for d in terraform/environments/*/; do
+            [ -d "$d" ] || continue
+            ALL_ENVS+=("$(basename "$d")")
+          done
+
+          if echo "$CHANGED" | grep -qE '^terraform/modules/'; then
+            echo "Module change detected -> planning ALL environments"
+            SELECTED=("${ALL_ENVS[@]}")
+          elif echo "$CHANGED" | grep -qE '^terraform/terragrunt\.hcl$'; then
+            echo "Root terragrunt.hcl change detected -> planning ALL environments"
+            SELECTED=("${ALL_ENVS[@]}")
+          else
+            SELECTED=()
+            for env in "${ALL_ENVS[@]}"; do
+              if echo "$CHANGED" | grep -qE "^terraform/environments/${env}/"; then
+                SELECTED+=("$env")
+              fi
+            done
+          fi
+
+          if [ ${#SELECTED[@]} -eq 0 ]; then
+            echo "No environments affected."
+            echo "include=[]" >> "$GITHUB_OUTPUT"
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          INCLUDE=$(
+            for env in "${SELECTED[@]}"; do
+              role=$(printf '%s' "$AWS_ROLE_ARNS" | jq -er --arg e "$env" '.[$e]') || {
+                echo "::error::No AWS_ROLE_ARNS entry for environment '$env'. Add it to the workflow env map." >&2
+                exit 1
+              }
+              jq -nc --arg env "$env" --arg role "$role" '{env:$env, role_arn:$role}'
+            done | jq -sc .
+          )
+          echo "Matrix include: $INCLUDE"
+          echo "include=$INCLUDE" >> "$GITHUB_OUTPUT"
+          echo "any=true" >> "$GITHUB_OUTPUT"
+
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        uses: gruntwork-io/terragrunt-action@v2
+        with:
+          tg_version: ${{ env.TG_VERSION }}
+          tf_version: ${{ env.TF_VERSION }}
+          tg_command: --version
+
+      - name: terraform fmt (recursive, .tf files)
+        run: terraform fmt -check -recursive -diff terraform/
+
+      - name: terragrunt hclfmt (.hcl files)
+        run: terragrunt hclfmt --check --diff --terragrunt-working-dir terraform/
+
+  plan:
+    name: Plan ${{ matrix.env }}
+    needs: [detect-changes, fmt]
+    if: needs.detect-changes.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect-changes.outputs.include) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        uses: gruntwork-io/terragrunt-action@v2
+        with:
+          tg_version: ${{ env.TG_VERSION }}
+          tf_version: ${{ env.TF_VERSION }}
+          tg_command: --version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tf-plan-${{ matrix.env }}
+
+      - name: Terragrunt init
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: terragrunt init -input=false -no-color
+
+      - name: Terragrunt plan
+        id: plan
+        working-directory: terraform/environments/${{ matrix.env }}
+        run: |
+          set -o pipefail
+          set +e
+          terragrunt plan -input=false -no-color -lock-timeout=5m 2>&1 | tee plan.txt
+          EXIT=${PIPESTATUS[0]}
+          set -e
+
+          SUMMARY_LINE=$(grep -E '^(Plan:|No changes\.)' plan.txt | tail -n1 || true)
+          if [[ "$SUMMARY_LINE" == Plan:* ]]; then
+            ADD=$(echo    "$SUMMARY_LINE" | sed -nE 's/.*Plan: ([0-9]+) to add.*/\1/p')
+            CHANGE=$(echo "$SUMMARY_LINE" | sed -nE 's/.* ([0-9]+) to change.*/\1/p')
+            DESTROY=$(echo "$SUMMARY_LINE" | sed -nE 's/.* ([0-9]+) to destroy.*/\1/p')
+          else
+            ADD=0; CHANGE=0; DESTROY=0
+          fi
+          ADD=${ADD:-0}; CHANGE=${CHANGE:-0}; DESTROY=${DESTROY:-0}
+
+          {
+            echo "add=$ADD"
+            echo "change=$CHANGE"
+            echo "destroy=$DESTROY"
+            echo "exit_code=$EXIT"
+          } >> "$GITHUB_OUTPUT"
+
+          exit "$EXIT"
+
+      - name: Comment plan on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          PLAN_ADD: ${{ steps.plan.outputs.add }}
+          PLAN_CHANGE: ${{ steps.plan.outputs.change }}
+          PLAN_DESTROY: ${{ steps.plan.outputs.destroy }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exit_code }}
+          PLAN_DIR: terraform/environments/${{ matrix.env }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENV_NAME;
+            const marker = `<!-- tfplan:${env} -->`;
+
+            let planBody = '';
+            try {
+              planBody = fs.readFileSync(`${process.env.PLAN_DIR}/plan.txt`, 'utf8');
+            } catch (e) {
+              planBody = `Plan output not available: ${e.message}`;
+            }
+            const MAX = 60000;
+            if (planBody.length > MAX) {
+              planBody = `... (truncated, showing last ${MAX} chars) ...\n` + planBody.slice(-MAX);
+            }
+
+            const exitCode = process.env.PLAN_EXIT;
+            const status = exitCode === '0' ? 'succeeded' : `failed (exit ${exitCode})`;
+
+            const body = [
+              marker,
+              `### Terraform plan — \`${env}\` — ${status}`,
+              '',
+              '```',
+              `Creations:    ${process.env.PLAN_ADD}`,
+              `Modifications: ${process.env.PLAN_CHANGE}`,
+              `Removes:       ${process.env.PLAN_DESTROY}`,
+              '```',
+              '',
+              '<details><summary>Show full plan</summary>',
+              '',
+              '```hcl',
+              planBody,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
