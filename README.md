@@ -71,6 +71,27 @@ Alarms have **no default destination** — `nat_alarm_actions` defaults to `[]`.
 
 ---
 
+## 💵 Estimated monthly cost (us-east-1)
+
+**NAT gateway hourly is unavoidable and dominates a small VPC's bill.** Everything else — VPC, subnets, IGW, gateway VPC endpoints, EIPs (while attached), route tables — is free.
+
+| Workload | NAT hourly (2×) | NAT data | Flow logs | Alarms | Total /mo |
+|---|---|---|---|---|---|
+| **Empty / idle** — infra only, no workloads | ~$66 | <$1 | $0 (under always-free tier) | $0.60 | **~$67** |
+| **Small** — 1–5 EC2/containers, few GB/day egress | ~$66 | $5–10 | $5–10 | $0.60 | **~$77–87** |
+| **Medium** — dozens of hosts, active egress | ~$66 | $45–90 | $75–150 | $0.60 | **~$186–306** |
+| **Large** — 100+ hosts, high egress | ~$66 | $200–500 | $250–500 | $0.60 | **~$517–1067** |
+
+**Free-tier notes:**
+- **CloudWatch Logs**: 5 GB ingest + 5 GB storage **always-free** per account — covers the flow-log volume of a small or idle VPC entirely.
+- **CloudWatch alarms**: first **10 alarms free for the first 12 months** on new accounts. This module creates 6, so alarms are $0 for a new account and $0.60/mo after that.
+- **VPC gateway endpoints** (S3, DynamoDB): always free — also save NAT-processing charges for S3/DDB traffic.
+- **EIPs**: free while attached to a running resource; both EIPs here are attached to NAT gateways.
+
+**If NAT hourly hurts** — the biggest cost lever is switching to a single-NAT design (~$33/mo instead of ~$66/mo) at the cost of losing per-AZ NAT failure resilience. Not exposed as a variable today; add when a real caller needs it. Adding interface VPC endpoints for services you hit heavily (SSM, ECR, CloudWatch Logs, Secrets Manager) also cuts NAT data-processing charges but adds ~$7/mo per endpoint per AZ.
+
+---
+
 ## 📁 Repository layout
 
 ```text
